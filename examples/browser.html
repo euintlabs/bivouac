@@ -1,0 +1,120 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>bivouac</title>
+<style>
+body{margin:0;background:#101014;color:#ddd;font:13px ui-monospace,monospace;display:grid;place-items:center;min-height:100vh}
+canvas{width:min(90vw,560px);image-rendering:pixelated;background:#16161c}
+p{opacity:.6}
+</style>
+</head>
+<body>
+<div>
+<canvas id="c" width="56" height="56"></canvas>
+<p id="s">loading weights</p>
+</div>
+<script type="module">
+import { brain, OnePlusOneES, gains, mulberry32, clamp } from '../js/bivouac.js'
+
+const G = 56, N = 180, T = 4, R = G * 0.42, cx = G / 2, cy = G / 2, rad = 2
+const hues = [20, 80, 190, 300]
+const rng = mulberry32(7)
+const res = await fetch('../python/weights.json').then((r) => r.json()).catch(() => null)
+const status = document.getElementById('s')
+if (!res) { status.textContent = 'train first: python train_es.py'; throw 0 }
+const net = brain(res.weights)
+const es = new OnePlusOneES({ dims: 3, rng })
+const spec = [['pick', 0, 0.4, 0.5, 1.6], ['drop', 1, 0.4, 0.5, 1.6], ['turn', 2, 0.5, 0.3, 1.8]]
+
+const grid = new Int8Array(G * G).fill(-1)
+for (let y = 0; y < G; y++) for (let x = 0; x < G; x++)
+  if (Math.hypot(x - cx, y - cy) <= R && rng() < 0.72) grid[y * G + x] = Math.floor(rng() * T)
+const ants = Array.from({ length: N }, () => {
+  const a = rng() * Math.PI * 2, r = rng() * R
+  return { x: Math.round(cx + Math.cos(a) * r), y: Math.round(cy + Math.sin(a) * r), c: -1 }
+})
+const ring = (k) => ((k + 0.62) / T) * R
+const band = R / T * 0.85
+
+function density(x, y, k) {
+  let s = 0, n = 0, o = 0
+  for (let j = -rad; j <= rad; j++) for (let i = -rad; i <= rad; i++) {
+    const X = x + i, Y = y + j
+    if (X < 0 || Y < 0 || X >= G || Y >= G) continue
+    const v = grid[Y * G + X]
+    n++
+    if (v >= 0) o++
+    if (v === k) s++
+  }
+  return [s / n, o / n]
+}
+
+function order() {
+  let s = 0, n = 0
+  for (let y = 0; y < G; y++) for (let x = 0; x < G; x++) {
+    const v = grid[y * G + x]
+    if (v < 0) continue
+    s += density(x, y, v)[0]
+    n++
+  }
+  return n ? s / n : 0
+}
+
+function tick() {
+  const g = gains(es.theta, spec)
+  for (const a of ants) {
+    const cell = grid[a.y * G + a.x]
+    const kind = a.c >= 0 ? a.c : cell
+    const dist = Math.hypot(a.x - cx, a.y - cy), d = Math.max(dist, 1)
+    const [f, occ] = kind >= 0 ? density(a.x, a.y, kind) : [0, 0]
+    const fit = kind >= 0 ? Math.exp(-(((dist - ring(kind)) / band) ** 2)) : 0
+    const out = net([a.c >= 0 ? 1 : 0, (a.c + 1) / (T + 1), f, fit, -(a.x - cx) / d, -(a.y - cy) / d, Math.min(1, dist / R), 0, T / 6, 0.5, 0.75])
+    if (a.c < 0 && cell >= 0) {
+      const p = (0.1 / (0.1 + f)) ** 2 * (0.35 + 0.65 * (1 - fit)) * clamp(1 + 0.45 * out[0], 0.4, 1.75) * g.pick
+      if (rng() < p) { a.c = cell; grid[a.y * G + a.x] = -1 }
+    } else if (a.c >= 0 && cell < 0) {
+      const p = (f / (0.16 + f)) ** 2 * (0.18 + 0.82 * fit) * clamp(1 + 0.45 * out[1], 0.4, 1.75) * g.drop
+      if (occ > 0.6 && rng() < 0.3) a.c = -1
+      else if (rng() < p) { grid[a.y * G + a.x] = a.c; a.c = -1 }
+    }
+    let sx, sy
+    if (a.c >= 0) {
+      const side = ring(a.c) > d ? 1 : -1
+      const h = Math.atan2((a.y - cy) / d * side, (a.x - cx) / d * side) + out[2] * 0.55 * g.turn
+      sx = Math.cos(h); sy = Math.sin(h)
+    } else { sx = rng() - 0.5; sy = rng() - 0.5 }
+    sx += (rng() - 0.5) * 1.2; sy += (rng() - 0.5) * 1.2
+    a.x = clamp(a.x + (sx > 0.33 ? 1 : sx < -0.33 ? -1 : 0), 0, G - 1)
+    a.y = clamp(a.y + (sy > 0.33 ? 1 : sy < -0.33 ? -1 : 0), 0, G - 1)
+  }
+}
+
+const ctx = document.getElementById('c').getContext('2d')
+const img = ctx.createImageData(G, G)
+const rgb = hues.map((h) => {
+  const f = (n) => { const k = (n + h / 30) % 12; return 255 * (0.62 - 0.3 * Math.max(-1, Math.min(k - 3, 9 - k, 1))) }
+  return [f(0), f(8), f(4)]
+})
+
+let frame = 0
+function draw() {
+  tick()
+  if (++frame % 10 === 0) {
+    const r = order()
+    if (es.observe(r)) status.textContent = `order ${r.toFixed(3)}  adapter gen ${es.generations}  sigma ${es.sigma().toFixed(3)}`
+  }
+  for (let i = 0; i < G * G; i++) {
+    const v = grid[i], o = i * 4
+    const c = v >= 0 ? rgb[v] : [22, 22, 28]
+    img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = 255
+  }
+  for (const a of ants) { const o = (a.y * G + a.x) * 4; img.data[o] = img.data[o + 1] = img.data[o + 2] = a.c >= 0 ? 255 : 120 }
+  ctx.putImageData(img, 0, 0)
+  requestAnimationFrame(draw)
+}
+draw()
+</script>
+</body>
+</html>
